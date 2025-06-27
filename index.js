@@ -11,37 +11,36 @@ const app = express()
 app.use(express.json())
 app.use(cors())
 
-// 連線 MongoDB Atlas
-mongoose.connect(process.env.MONGO_URL, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-})
-.then(() => console.log('Connected to MongoDB Atlas'))
-.catch(err => console.error('MongoDB connection error:', err))
+// 🧠 MongoDB 連線
+mongoose
+  .connect(process.env.MONGO_URL)
+  .then(() => console.log('✅ Connected to MongoDB'))
+  .catch(err => console.error('❌ MongoDB connection error:', err))
 
-// User Schema
+// 🧩 Schema
+const bookSchema = new mongoose.Schema({
+  content: String,
+  createdAt: { type: Date, default: Date.now }
+})
+
 const userSchema = new mongoose.Schema({
-  email: { type: String, unique: true, required: true },
-  password: { type: String, required: true },
-  refreshTokens: [String], // 可存多個 refresh token
-  books: [{
-    content: String,
-    createdAt: { type: Date, default: Date.now }
-  }]
+  email: String,
+  password: String,
+  books: [bookSchema]
 })
 
 const User = mongoose.model('User', userSchema)
 
-// JWT 產生函式
+// 🔐 JWT
 function generateAccessToken(user) {
-  return jwt.sign({ id: user._id, email: user.email }, process.env.ACCESS_TOKEN_SECRET, { expiresIn: '15m' })
+  return jwt.sign({ id: user._id }, process.env.ACCESS_TOKEN_SECRET, { expiresIn: '15m' })
 }
 
 function generateRefreshToken(user) {
-  return jwt.sign({ id: user._id, email: user.email }, process.env.REFRESH_TOKEN_SECRET)
+  return jwt.sign({ id: user._id }, process.env.REFRESH_TOKEN_SECRET)
 }
 
-// Middleware：驗證 accessToken
+// 🔒 驗證 Middleware
 function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization']
   const token = authHeader && authHeader.split(' ')[1]
@@ -54,120 +53,115 @@ function authenticateToken(req, res, next) {
   })
 }
 
-// 註冊
+// 🧾 refresh token 暫存
+let refreshTokens = []
+
+// 🧷 註冊
 app.post('/register', async (req, res) => {
   const { email, password } = req.body
-  if (!email || !password) return res.status(400).json({ message: 'Email and password required' })
+  const existing = await User.findOne({ email })
+  if (existing) return res.status(400).json({ message: 'Email already registered' })
 
-  try {
-    const existingUser = await User.findOne({ email })
-    if (existingUser) return res.status(409).json({ message: 'User already exists' })
+  const hashedPassword = await bcrypt.hash(password, 10)
+  const user = new User({ email, password: hashedPassword })
+  await user.save()
 
-    const hashedPassword = await bcrypt.hash(password, 10)
-    const user = new User({ email, password: hashedPassword, refreshTokens: [] })
-    await user.save()
-    res.json({ message: 'User registered' })
-  } catch (err) {
-    console.error(err)
-    res.status(500).json({ message: 'Server error' })
-  }
+  res.json({ message: 'User registered' })
 })
 
-// 登入
+// 🔑 登入
 app.post('/login', async (req, res) => {
   const { email, password } = req.body
-  if (!email || !password) return res.status(400).json({ message: 'Email and password required' })
+  const user = await User.findOne({ email })
+  if (!user) return res.status(403).json({ message: 'Invalid credentials' })
 
-  try {
-    const user = await User.findOne({ email })
-    if (!user) return res.status(403).json({ message: 'Invalid credentials' })
+  const match = await bcrypt.compare(password, user.password)
+  if (!match) return res.status(403).json({ message: 'Invalid credentials' })
 
-    const match = await bcrypt.compare(password, user.password)
-    if (!match) return res.status(403).json({ message: 'Invalid credentials' })
+  const accessToken = generateAccessToken(user)
+  const refreshToken = generateRefreshToken(user)
+  refreshTokens.push(refreshToken)
 
-    const accessToken = generateAccessToken(user)
-    const refreshToken = generateRefreshToken(user)
-
-    // 儲存 refreshToken 到資料庫
-    user.refreshTokens.push(refreshToken)
-    await user.save()
-
-    res.json({ accessToken, refreshToken })
-  } catch (err) {
-    console.error(err)
-    res.status(500).json({ message: 'Server error' })
-  }
+  res.json({ accessToken, refreshToken })
 })
 
-// 使用 refreshToken 取得新的 accessToken
-app.post('/refresh', async (req, res) => {
+// 🔁 Refresh Token
+app.post('/refresh', (req, res) => {
   const { token } = req.body
-  if (!token) return res.sendStatus(401)
+  if (!token || !refreshTokens.includes(token)) return res.sendStatus(403)
 
-  try {
-    const payload = jwt.verify(token, process.env.REFRESH_TOKEN_SECRET)
-
-    const user = await User.findById(payload.id)
-    if (!user) return res.sendStatus(403)
-
-    // 檢查 refreshToken 是否存在
-    if (!user.refreshTokens.includes(token)) return res.sendStatus(403)
-
-    const accessToken = generateAccessToken(user)
+  jwt.verify(token, process.env.REFRESH_TOKEN_SECRET, (err, user) => {
+    if (err) return res.sendStatus(403)
+    const accessToken = generateAccessToken({ _id: user.id })
     res.json({ accessToken })
-  } catch (err) {
-    return res.sendStatus(403)
-  }
+  })
 })
 
-// 登出 (撤銷 refresh token)
-app.post('/logout', async (req, res) => {
+// 🚪 登出：撤銷 refresh token
+app.post('/logout', (req, res) => {
   const { token } = req.body
-  if (!token) return res.sendStatus(400)
-
-  try {
-    const payload = jwt.verify(token, process.env.REFRESH_TOKEN_SECRET)
-    const user = await User.findById(payload.id)
-    if (!user) return res.sendStatus(403)
-
-    // 把該 refreshToken 從陣列移除
-    user.refreshTokens = user.refreshTokens.filter(t => t !== token)
-    await user.save()
-
-    res.json({ message: 'Logged out successfully' })
-  } catch (err) {
-    res.sendStatus(403)
-  }
+  refreshTokens = refreshTokens.filter(t => t !== token)
+  res.json({ message: 'Logged out successfully' })
 })
 
-// 取得用戶資料
+// 👤 取得用戶資料
 app.get('/me', authenticateToken, async (req, res) => {
-  try {
-    const user = await User.findById(req.user.id).select('-password -refreshTokens')
-    if (!user) return res.sendStatus(404)
-    res.json(user)
-  } catch (err) {
-    res.status(500).json({ message: 'Server error' })
-  }
+  const user = await User.findById(req.user.id)
+  if (!user) return res.status(404).json({ message: 'User not found' })
+
+  res.json({
+    id: user._id,
+    email: user.email,
+    books: user.books
+  })
 })
 
-// 新增書本資料
+// 📘 新增書籍
 app.post('/book', authenticateToken, async (req, res) => {
   const { content } = req.body
-  if (!content) return res.status(400).json({ message: 'Content is required' })
+  const user = await User.findById(req.user.id)
+  if (!user) return res.status(404).json({ message: 'User not found' })
 
-  try {
-    const user = await User.findById(req.user.id)
-    if (!user) return res.sendStatus(404)
+  const book = { content }
+  user.books.push(book)
+  await user.save()
 
-    user.books.push({ content, createdAt: new Date() })
-    await user.save()
-
-    res.json({ message: 'Book saved', book: user.books[user.books.length -1] })
-  } catch (err) {
-    res.status(500).json({ message: 'Server error' })
-  }
+  res.json({ message: 'Book saved', book: user.books[user.books.length - 1] })
 })
 
+// ✏️ 修改書籍
+app.put('/book/:bookId', authenticateToken, async (req, res) => {
+  const { content } = req.body
+  const user = await User.findById(req.user.id)
+  if (!user) return res.status(404).json({ message: 'User not found' })
+
+  const book = user.books.id(req.params.bookId)
+  if (!book) return res.status(404).json({ message: 'Book not found' })
+
+  book.content = content
+  await user.save()
+
+  res.json({ message: 'Book updated', book })
+})
+
+// 🗑️ 刪除書籍
+app.delete('/book/:bookId', authenticateToken, async (req, res) => {
+  const user = await User.findById(req.user.id)
+  if (!user) return res.status(404).json({ message: 'User not found' })
+
+  const originalLength = user.books.length
+  user.books = user.books.filter(book => book._id.toString() !== req.params.bookId)
+
+  if (user.books.length === originalLength) {
+    return res.status(404).json({ message: 'Book not found' })
+  }
+
+  await user.save()
+  res.json({ message: 'Book deleted' })
+})
+
+// 🚀 啟動伺服器
 const PORT = process.env.PORT || 3000
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`))
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`)
+})
