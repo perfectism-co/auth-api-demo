@@ -2,7 +2,6 @@
   "name": "auth-api-demo",
   "version": "1.0.0",
   "main": "index.js",
-  "type": "module",
   "scripts": {
     "start": "node index.js"
   },
@@ -13,3 +12,6 @@
     "jsonwebtoken": "^9.0.2"
   }
 }
+
+
+
